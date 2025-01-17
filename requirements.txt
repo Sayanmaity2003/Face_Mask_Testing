@@ -1,0 +1,5 @@
+numpy==1.23.5  # or the version compatible with your TensorFlow setup
+opencv-python==4.8.0.74  # For OpenCV (Haarcascade)
+Pillow==9.4.0  # For image handling (PIL)
+tensorflow==2.12.0  # Replace with the TensorFlow version you are using
+pygame==2.1.3  # For sound alerts
