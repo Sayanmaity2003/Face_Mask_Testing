@@ -5,22 +5,22 @@ import tensorflow as tf
 from werkzeug.utils import secure_filename
 import os
 import threading
-
+import pygame
+import time
+import base64
 app = Flask(__name__)
-
-# Configure upload folder
-app.config['UPLOAD_FOLDER'] = os.path.join(app.root_path, 'static/uploads')
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+app.config['UPLOAD_FOLDER'] = './static/uploads'
 
 # Load the Haarcascade for face detection
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
 # Load your pre-trained face mask detection model
-model = tf.keras.models.load_model(os.path.join(app.root_path, "mask_detector.h5"))
+model = tf.keras.models.load_model("mask_detector.h5")
 
-# Global variables to control video feed
+# Global variables to control video feed and alarm
 video_active = False
 lock = threading.Lock()
+alarm_active = False
 
 
 def detect_mask(face):
@@ -34,6 +34,17 @@ def detect_mask(face):
     return label, confidence
 
 
+def play_alarm():
+    """Play an alarm sound in a loop when triggered."""
+    global alarm_active
+    pygame.mixer.init()
+    pygame.mixer.music.load("alert.mp3")
+    pygame.mixer.music.play(-1)  # Play in a loop
+    while alarm_active:
+        pass  # Keep playing until alarm_active is False
+    pygame.mixer.music.stop()
+
+
 @app.route('/')
 def index():
     """Render the home page."""
@@ -42,19 +53,18 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 def upload_image():
-    """Handle image upload and prediction."""
+    """Handle image upload and prediction without saving the resultant image."""
     if 'file' not in request.files:
         return redirect(request.url)
     file = request.files['file']
     if file.filename == '':
         return redirect(request.url)
     if file:
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
+        # Read the uploaded image file
+        np_img = np.frombuffer(file.read(), np.uint8)
+        img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
 
-        # Read the image and predict
-        img = cv2.imread(filepath)
+        # Convert the image to grayscale and detect faces
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
 
@@ -62,10 +72,31 @@ def upload_image():
         for (x, y, w, h) in faces:
             face = img[y:y + h, x:x + w]
             label, confidence = detect_mask(face)
-            results.append((label, confidence * 100))
+            confidence_percent = confidence * 100
+            confidence_text = f"{confidence_percent:.2f}%"
 
-        return render_template("index.html", uploaded_image=filename, results=results)
+            # Set color and label based on mask detection
+            if label == "Mask":
+                color = (0, 255, 0)  # Green for with mask
+            else:
+                color = (0, 0, 255)  # Red for no mask
+
+            # Draw rectangle around the face
+            cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
+
+            # Display label and confidence score
+            cv2.putText(img, f"{label} ({confidence_text})", (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+
+            results.append((label, confidence_percent))
+
+        # Encode the processed image as a base64 string
+        _, buffer = cv2.imencode('.jpg', img)
+        img_base64 = base64.b64encode(buffer).decode('utf-8')
+
+        return render_template("index.html", results=results, result_image=img_base64)
     return redirect(url_for('index'))
+
 
 
 @app.route('/start_video')
@@ -88,7 +119,7 @@ def stop_video():
 
 def generate_frames():
     """Generate frames for live video feed."""
-    global video_active
+    global video_active, alarm_active
     cap = cv2.VideoCapture(0)
     while True:
         with lock:
@@ -102,15 +133,41 @@ def generate_frames():
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
 
+        face_detected_without_mask = False
+
         for (x, y, w, h) in faces:
             face = frame[y:y + h, x:x + w]
             label, confidence = detect_mask(face)
 
+            # Convert confidence to percentage format
+            confidence_percent = confidence * 100
+            confidence_text = f"{confidence_percent:.2f}%"
+
             # Set color and label based on mask detection
-            color = (0, 255, 0) if label == "Mask" else (0, 0, 255)
+            if label == "Mask":
+                color = (0, 255, 0)  # Green for with mask
+            else:
+                color = (0, 0, 255)  # Red for no mask
+
+            # Draw rectangle around the face
             cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-            cv2.putText(frame, f"{label} ({confidence:.2f}%)", (x, y - 10),
+
+            # Display label and confidence score
+            cv2.putText(frame, f"{label} ({confidence_text})", (x, y - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+
+            # If no mask detected, activate alarm
+            if label == "No Mask":
+                face_detected_without_mask = True
+
+        # If face detected without a mask, trigger alarm
+        if face_detected_without_mask and not alarm_active:
+            alarm_active = True
+            threading.Thread(target=play_alarm, daemon=True).start()
+
+        # If no face without a mask, stop alarm
+        elif not face_detected_without_mask and alarm_active:
+            alarm_active = False
 
         # Encode the frame to be sent to the client
         _, buffer = cv2.imencode('.jpg', frame)
@@ -120,6 +177,10 @@ def generate_frames():
                b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
     cap.release()
+    alarm_active = False
+
+
+
 
 
 @app.route('/video_feed')
@@ -128,5 +189,6 @@ def video_feed():
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
-if __name__ == "__main__":
-    app.run()
+if __name__ == '__main__':
+    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+    app.run(debug=True)
