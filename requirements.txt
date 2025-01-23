@@ -4,3 +4,4 @@ numpy
 tensorflow
 Werkzeug
 pygame
+gunicorn
